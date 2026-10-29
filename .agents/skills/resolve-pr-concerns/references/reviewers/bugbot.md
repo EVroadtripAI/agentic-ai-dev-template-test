@@ -1,0 +1,123 @@
+# Reviewer adapter notes: Cursor Bugbot (`bugbot`)
+
+Vendor quirks for the `bugbot` entry in `.github/pr-reviewer.json`. Skill prose
+names no vendor; read this file before interpreting a review when
+`.active == "bugbot"`. Config fields (check name, trigger, logins, marker,
+verdict patterns) live in the config — this file covers what a field can't say.
+
+> **Before switching to (or back to) Bugbot, read this caveat:** require the
+> vendor-neutral `review-gate` status in the `main` ruleset (it follows `active`, so
+> nothing else needs to change), and **never make the `Cursor Bugbot` check itself
+> required.** Bugbot can't post its check on merge-group commits, so a required
+> Bugbot check wedges a merge queue; keeping it required would mean dropping the
+> merge queue and requiring up-to-date branches instead, which brings back manual
+> catch-up merges. Also restore the noise filters: copy
+> `.github/review-guidelines.md` to `.cursor/BUGBOT.md` (see "Config" below).
+>
+> **No final full review.** Bugbot's scope (incremental vs comprehensive) is set in
+> the Bugbot admin UI, and no comment asks for a full review, so its five
+> final-review fields are `null` and the gate requires none.
+
+## Installing and triggering
+
+- Bugbot reviews nothing until it is **installed** (the Cursor GitHub App,
+  https://github.com/apps/cursor/installations) and **enabled** for the repo on the
+  Cursor side (https://cursor.com/dashboard/bugbot/installation). A repo created
+  from this template starts with neither.
+- Trigger mode is a **per-repo Cursor dashboard setting**, not something the repo
+  controls:
+  - **Automatic** — reviews on every PR create/update (push).
+  - **Manual** — reviews only when someone comments `bugbot run` (the config's
+    `trigger_comment`; `cursor review` also works) on the PR.
+  Teams sometimes switch automatic mode off to control usage-based cost, so detect
+  the mode per PR (`resolve-pr-concerns` Step 1a) rather than assuming it, and
+  after each push check that a review started before deciding to comment (Step 5).
+  An old rule of thumb, "don't comment `bugbot run`, it subscribes to pushes on its
+  own", was wrong: agents withheld the trigger and a human ended up running Bugbot
+  by hand on every PR.
+- Reviews typically land within a couple of minutes of the trigger.
+
+## Detecting a result — do NOT trust the status check alone
+
+- The verdict and findings live in the **review** + **inline review comments**,
+  decoupled from the `Cursor Bugbot` **status check**. The check can read
+  `skipping` / `neutral` / `pending` while a complete review with findings exists
+  (observed in practice). A green check is not proof you've read its findings.
+- **Author logins vary.** The summary review has been observed authored by both
+  `cursor` and `cursor[bot]`, and inline finding threads likewise. Filtering on one
+  login can report "never reviewed" for a clean review and hide a real finding.
+  `bot_logins` lists both; key on the summary marker.
+- **Summary marker:** `<!-- BUGBOT_REVIEW -->`. Verdict: `found no new issues` =
+  pass; `found N potential issue(s)` = N inline findings to enumerate.
+- **A superseded summary goes stale.** Bugbot rewrites an older run's summary as a
+  `<!-- BUGBOT_REVIEW_STALE -->` "Stale Bugbot comment from a previous run" review.
+  It matches neither verdict pattern, so a head whose newest Bugbot review is stale
+  reads `verdict: none`: trigger a fresh review.
+- **Findings are NEVER in issue-comments** — the PR's issue-comments hold only the
+  `bugbot run` trigger comments (hence `summary_in_issue_comments: false`).
+- **`commit_id` is `null` on `gh pr view --json reviews`**, so a monitor filtering
+  that output by head SHA never matches. Identify a fresh review by author +
+  `submittedAt` newer than your trigger + the marker; the reviewed SHA is in the
+  body's `Reviewed by Cursor Bugbot for commit <sha>` footer. The REST
+  `repos/<owner>/<repo>/pulls/<n>/reviews` endpoint (which `reviewer_state.py` and
+  `wait_for_pr_checks.py` read) does carry `commit_id`, which is why the adapter's
+  `reviewed_sha_pattern` is `null`.
+- **Re-anchored findings:** a prior finding re-posted on a new head keeps its
+  `BUGBOT_BUG_ID` while the footer references an older SHA — that is the
+  already-addressed finding awaiting human resolution, not a new one.
+- **No reply to the trigger, no thread-less findings.** Bugbot doesn't answer
+  `bugbot run` with a status reply and keeps every finding in a thread, so its
+  `incremental_review_*_pattern` fields are `null` and `unthreaded_finding_patterns`
+  is `[]`: `incremental_review_outcome` reads `not_tracked` (watch `verdict`
+  instead) and `unthreaded_findings` is always empty.
+
+- `rate_limited_pattern` and the rate-limit wait fields are `null`: Bugbot is
+  usage-billed with no included-review quota to wait out, so `reviewer_state.py`
+  never reports a refusal for it.
+
+## Local review: none yet
+
+`local_review` and `local_preflight` are `null`: Bugbot has no command-line review to
+wrap, so with Bugbot active, fix rounds stay PR rounds (`bugbot run`), and
+`review_preflight.py` reads `not_configured`. Checked in October 2026:
+
+- Cursor's **Agent Review** reviews local changes with Bugbot's rules, at a Quick or
+  Deep depth, but only inside the Cursor editor (the agent window, or the Source
+  Control tab): https://cursor.com/docs/agent/agent-review
+- The **Cursor CLI** (`agent`) is a general coding agent with no review or Bugbot
+  command (https://cursor.com/docs/cli/overview). Its
+  [headless "code review" example](https://cursor.com/docs/cli/headless) is a prompt
+  to a model, not Bugbot, so wiring it in would make this adapter misleading.
+- The Bugbot API's `/bugbot/review` is Enterprise-only and reviews a PR, not local
+  changes: https://cursor.com/docs/bugbot
+
+When Cursor ships a headless Agent Review, declare it here as `local_review` (its
+command with `{base}`, and how its output marks findings and completion) plus a
+`local_preflight` if it reports its allowance, and set the five final-review fields
+(a local reviewer's one PR request is its final full review); the skills need no
+change.
+
+## CODEOWNERS and `review-gate`
+
+If the default branch has a CODEOWNERS file (`.github/CODEOWNERS`, `CODEOWNERS` or
+`docs/CODEOWNERS`), `review-gate` also fails while a changed path's owner hasn't
+approved the head (`@<owner> must approve: …`), whatever Bugbot's verdict. It resolves
+user logins only: a CODEOWNERS line naming a team (`@org/team`) or an email owner,
+alone or beside users, is skipped by this gate (as is a line with `!`, `[...]` or `\`
+in its pattern) and its paths are left to GitHub's own "Require review from Code
+Owners" rule, so turn that rule on if you rely on team owners. Without a CODEOWNERS
+file, or with one naming no user owner, the ownership half does nothing.
+
+## Threads
+
+- `self_resolves_threads: true` — Bugbot resolves its own addressed threads once a
+  later push fixes them (observed on real PRs). `resolve-pr-concerns` Step 4d still
+  replies with the fix SHA; if the bot already resolved the thread, don't re-open it.
+
+## Config
+
+- Noise filters: Bugbot reads `.cursor/BUGBOT.md`, which this template does not
+  ship (it keeps no vendor directory). The filters live in the vendor-neutral
+  `.github/review-guidelines.md`; to wire them in, restore them as
+  `.cursor/BUGBOT.md` (a copy of that file), and re-copy it after each edit to the
+  guidelines.

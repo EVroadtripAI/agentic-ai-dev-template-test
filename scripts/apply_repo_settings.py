@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Reconcile this repo's live settings with .github/repo-settings/.
+
+Covers the `main` ruleset, PR-merge prefs, and Dependabot security updates.
+Reads the canonical settings, diffs them against the live repo (via `gh`), prints
+the diff, and — unless ``--yes`` — asks for confirmation before applying. Idempotent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import re
+import subprocess
+import sys
+from collections.abc import Callable, Container
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    # Aliases live here because this stdlib-only script may run under an older
+    # system python3, where a runtime ``int | None`` inside an alias would fail.
+    # Plain assignments, not ``type X = ...`` (a SyntaxError before 3.12, even
+    # here) or ``TypeAlias`` (ruff UP040); mypy reads these as aliases.
+
+    # A decoded GitHub JSON object. Values are mixed (strings, booleans, lists,
+    # nested objects), so ``dict[str, str]`` would be wrong; keys are always str.
+    JsonObject = dict[str, Any]
+    # One planned change: (setting kind, HTTP method, ruleset id for a PUT).
+    Action = tuple[
+        Literal["ruleset", "merge", "security"],
+        Literal["POST", "PUT", "PATCH"],
+        int | None,
+    ]
+
+
+class CommandResult(Protocol):
+    """The part of a finished ``gh`` process this script reads."""
+
+    stdout: str
+
+
+REPO_SETTINGS_DIR = Path(__file__).resolve().parent.parent / ".github" / "repo-settings"
+
+# Rule types the bootstrap phase defers until the setup PR merges: the required CI
+# checks (their workflow isn't on main yet) and the merge queue (with no required
+# checks it would merge untested).
+DEFERRED_RULE_TYPES = frozenset({"required_status_checks", "merge_queue"})
+
+# Ruleset fields we assert; everything else (id, timestamps, _links) is ignored.
+_RULESET_KEYS = (
+    "name",
+    "target",
+    "enforcement",
+    "conditions",
+    "rules",
+    "bypass_actors",
+)
+
+
+@dataclass
+class Desired:
+    """The canonical settings loaded from disk."""
+
+    ruleset: JsonObject
+    merge: JsonObject
+    security: JsonObject
+
+
+def load_desired(settings_dir: Path) -> Desired:
+    """Load the desired ruleset + merge + security settings from ``settings_dir``."""
+    ruleset = json.loads((settings_dir / "ruleset.json").read_text(encoding="utf-8"))
+    merge = json.loads(
+        (settings_dir / "merge-settings.json").read_text(encoding="utf-8")
+    )
+    security = json.loads(
+        (settings_dir / "security-settings.json").read_text(encoding="utf-8")
+    )
+    return Desired(ruleset=ruleset, merge=merge, security=security)
+
+
+def ruleset_for_phase(
+    ruleset: JsonObject, phase: Literal["bootstrap", "final"]
+) -> JsonObject:
+    """Return the ruleset safe for the requested initialization phase.
+
+    Parameters
+    ----------
+    ruleset
+        Canonical final ruleset loaded from disk.
+    phase
+        ``bootstrap`` defers ``DEFERRED_RULE_TYPES``; ``final`` keeps every rule.
+
+    Returns
+    -------
+    JsonObject
+        A deep copy suitable for reconciliation.
+
+    Raises
+    ------
+    ValueError
+        If ``phase`` is not supported.
+    """
+    if phase not in {"bootstrap", "final"}:
+        raise ValueError(f"unknown settings phase: {phase!r}")
+    phased = copy.deepcopy(ruleset)
+    if phase == "bootstrap":
+        phased["rules"] = [
+            rule
+            for rule in phased.get("rules", [])
+            if rule.get("type") not in DEFERRED_RULE_TYPES
+        ]
+    return phased
+
+
+def has_rule(ruleset: JsonObject, rule_type: str) -> bool:
+    """Whether ``ruleset`` declares a rule of ``rule_type``."""
+    return any(rule.get("type") == rule_type for rule in ruleset.get("rules", []))
+
+
+def without_rule(ruleset: JsonObject, rule_type: str) -> JsonObject:
+    """Return a deep copy of ``ruleset`` with every ``rule_type`` rule removed."""
+    trimmed = copy.deepcopy(ruleset)
+    trimmed["rules"] = [
+        rule for rule in trimmed.get("rules", []) if rule.get("type") != rule_type
+    ]
+    return trimmed
+
+
+def merge_queue_eligibility(
+    repo: JsonObject, org: JsonObject | None
+) -> tuple[Literal["yes", "no", "unknown"], str]:
+    """Decide whether GitHub offers a merge queue for this repository.
+
+    GitHub offers merge queues on organization-owned repositories that are public,
+    or private/internal on GitHub Enterprise Cloud. The org's plan is only readable
+    by its owners, so a private org repo whose plan can't be read is ``unknown``.
+
+    Parameters
+    ----------
+    repo
+        ``GET repos/{repo}``.
+    org
+        ``GET orgs/{owner}`` for a non-public org repo, or None when unread.
+
+    Returns
+    -------
+    tuple
+        ``yes`` / ``no`` / ``unknown``, and the reason, for the operator.
+    """
+    owner = repo.get("owner") or {}
+    if owner.get("type") != "Organization":
+        return "no", "the repository is owned by a user, not an organization"
+    if repo.get("visibility") == "public":
+        return "yes", "the repository is public and organization-owned"
+    plan = ((org or {}).get("plan") or {}).get("name")
+    if plan is None:
+        return "unknown", "the organization's plan isn't visible to this account"
+    if plan == "enterprise":
+        return "yes", "the organization is on GitHub Enterprise Cloud"
+    return "no", f"the repository is private and the organization's plan is {plan!r}"
+
+
+def _is_merge_queue_rejection(exc: RuntimeError) -> bool:
+    """Whether GitHub refused a ruleset because it offers no merge queue here."""
+    # GitHub doesn't document the wording; accept `merge_queue` or "merge queue".
+    detail = str(exc)
+    return "HTTP 422" in detail and bool(
+        re.search(r"merge[_ ]queue", detail, re.IGNORECASE)
+    )
+
+
+def _no_queue_notice(repo: str, reason: str) -> str:
+    return (
+        f"{repo}: no merge queue -- {reason}. GitHub offers merge queues only on "
+        "organization-owned repositories (public, or private on Enterprise Cloud); "
+        "PRs here merge without one."
+    )
+
+
+def find_main_ruleset(existing: list[JsonObject]) -> JsonObject | None:
+    """Return the ruleset named ``main`` from ``existing``, or None."""
+    for rs in existing:
+        if rs.get("name") == "main":
+            return rs
+    return None
+
+
+def _is_subset(desired: object, current: object) -> bool:
+    """Return True when ``desired`` is contained in ``current`` (recursively).
+
+    GitHub's rulesets API returns rules/conditions with default-populated fields
+    that our sanitized ruleset.json omits, so a strict ``==`` would never match an
+    already-applied ruleset and we'd re-PUT it every run. Subset semantics: dicts
+    match when every desired key is present and contained; lists match when each
+    desired element is contained in some current element; scalars match on ``==``.
+    """
+    if isinstance(desired, dict):
+        if not isinstance(current, dict):
+            return False
+        return all(
+            k in current and _is_subset(v, current[k]) for k, v in desired.items()
+        )
+    if isinstance(desired, list):
+        if not isinstance(current, list):
+            return False
+        return all(any(_is_subset(d, c) for c in current) for d in desired)
+    return desired == current
+
+
+def ruleset_matches(desired: JsonObject, current: JsonObject) -> bool:
+    """Return True when ``current`` already satisfies ``desired`` on the asserted keys.
+
+    Uses subset (not strict-equality) comparison so GitHub's API-default fields on
+    the live ruleset don't cause a spurious "needs update" every run.
+    """
+    return all(
+        _is_subset(desired[k], current.get(k)) for k in _RULESET_KEYS if k in desired
+    )
+
+
+def merge_settings_match(desired: JsonObject, current: JsonObject) -> bool:
+    """Return True when every desired merge key already has the desired value."""
+    return all(current.get(k) == v for k, v in desired.items())
+
+
+def security_settings_match(desired: JsonObject, current_repo: JsonObject) -> bool:
+    """Return True when the live repo's security config already satisfies desired.
+
+    ``current_repo`` is the full `GET /repos/{owner}/{repo}` response (the same
+    object already fetched for merge-settings matching) — its
+    ``security_and_analysis`` block carries other toggles (secret scanning, etc.)
+    our sanitized security-settings.json doesn't assert on, so subset (not
+    strict-equality) comparison via ``_is_subset`` avoids a spurious mismatch.
+    """
+    return _is_subset(desired, current_repo)
+
+
+def plan_actions(
+    current_rulesets: list[JsonObject],
+    current_merge: JsonObject,
+    desired_ruleset: JsonObject,
+    desired_merge: JsonObject,
+    desired_security: JsonObject,
+    forbidden_rule_types: Container[str] | None = None,
+) -> list[Action]:
+    """Compute the minimal set of apply actions.
+
+    Returns a list of ``Action`` tuples: ``("ruleset", "POST"|"PUT", id_or_None)``,
+    ``("merge", "PATCH", None)``, and/or ``("security", "PATCH", None)``. Empty
+    list means everything is already aligned.
+    """
+    actions: list[Action] = []
+    main = find_main_ruleset(current_rulesets)
+    if main is None:
+        actions.append(("ruleset", "POST", None))
+    elif not ruleset_matches(desired_ruleset, main) or any(
+        rule.get("type") in (forbidden_rule_types or ())
+        for rule in main.get("rules", [])
+    ):
+        actions.append(("ruleset", "PUT", main["id"]))
+    if not merge_settings_match(desired_merge, current_merge):
+        actions.append(("merge", "PATCH", None))
+    if not security_settings_match(desired_security, current_merge):
+        actions.append(("security", "PATCH", None))
+    return actions
+
+
+def _run_gh(
+    args: list[str],
+    runner: Callable[..., CommandResult] = subprocess.run,
+    **kwargs: Any,
+) -> CommandResult:
+    """Run GitHub CLI and translate failures into actionable messages."""
+    try:
+        return runner(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            **kwargs,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "GitHub CLI `gh` was not found. Install it, ensure it is on PATH, "
+            "then run `gh auth login`."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        # `gh api` puts the summary ("... (HTTP 422)") on stderr and GitHub's error
+        # body -- which names the offending field -- on stdout; keep both.
+        parts = [str(part).strip() for part in (exc.stderr, exc.stdout) if part]
+        detail = " ".join(part for part in parts if part) or "No error detail returned."
+        permission_hint = ""
+        if any(token in detail for token in ("HTTP 403", "HTTP 404", "accessible")):
+            permission_hint = (
+                " Confirm that the target repository is correct and the active "
+                "GitHub account has administrator permission."
+            )
+        raise RuntimeError(
+            f"GitHub command `gh {' '.join(args)}` failed. "
+            f"GitHub said: {detail}.{permission_hint}"
+        ) from exc
+
+
+def _gh_json(
+    args: list[str], runner: Callable[..., CommandResult] = subprocess.run
+) -> Any:
+    """Run a `gh` command and parse its stdout as JSON.
+
+    Returns ``Any`` because the shape depends on the endpoint (an object for
+    ``repos/{repo}``, a list for ``.../rulesets``), or None for empty output.
+    """
+    proc = _run_gh(args, runner)
+    return json.loads(proc.stdout) if proc.stdout.strip() else None
+
+
+def _current_rulesets(
+    repo: str, runner: Callable[..., CommandResult] = subprocess.run
+) -> list[JsonObject]:
+    """Fetch this repo's rulesets, with full detail for the ``main`` one.
+
+    `GET /repos/{owner}/{repo}/rulesets` (the list endpoint) returns bare
+    summaries — no ``conditions``/``rules``/``bypass_actors`` — so comparing
+    those against ``desired.ruleset`` via ``ruleset_matches`` would always see
+    a mismatch and re-PUT on every run. Fetch the single-ruleset endpoint for
+    ``main`` specifically to get the fields we actually need to compare.
+    """
+    summaries = _gh_json(["api", f"repos/{repo}/rulesets"], runner) or []
+    return [
+        (
+            _gh_json(["api", f"repos/{repo}/rulesets/{rs['id']}"], runner)
+            if rs.get("name") == "main"
+            else rs
+        )
+        for rs in summaries
+    ]
+
+
+def _apply_actions(
+    actions: list[Action],
+    repo: str,
+    desired: Desired,
+    desired_ruleset: JsonObject,
+    runner: Callable[..., CommandResult],
+) -> None:
+    """Apply a confirmed settings plan to the explicit repository target."""
+    for kind, method, ident in actions:
+        if kind == "ruleset":
+            endpoint = f"repos/{repo}/rulesets"
+            if method == "PUT":
+                endpoint += f"/{ident}"
+            _run_gh(
+                ["api", "--method", method, endpoint, "--input", "-"],
+                runner,
+                input=json.dumps(desired_ruleset),
+            )
+        elif kind == "merge":
+            _run_gh(
+                ["api", "--method", "PATCH", f"repos/{repo}", "--input", "-"],
+                runner,
+                input=json.dumps(desired.merge),
+            )
+        elif kind == "security":
+            _run_gh(
+                ["api", "--method", "PATCH", f"repos/{repo}", "--input", "-"],
+                runner,
+                input=json.dumps(desired.security),
+            )
+
+
+def main(
+    argv: list[str] | None = None,
+    runner: Callable[..., CommandResult] = subprocess.run,
+) -> int:
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--repo",
+        required=True,
+        help="explicit GitHub target in owner/repository form",
+    )
+    parser.add_argument(
+        "--phase",
+        choices=("bootstrap", "final"),
+        default="final",
+        help="bootstrap defers required CI checks; final applies every rule",
+    )
+    parser.add_argument("--yes", action="store_true", help="apply without confirmation")
+    parser.add_argument("--settings-dir", default=str(REPO_SETTINGS_DIR))
+    args = parser.parse_args(argv)
+
+    desired = load_desired(Path(args.settings_dir))
+    repo = str(args.repo)
+    desired_ruleset = ruleset_for_phase(desired.ruleset, args.phase)
+    try:
+        current_rulesets = _current_rulesets(repo, runner)
+        current_merge = _gh_json(["api", f"repos/{repo}"], runner) or {}
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    queue_verdict, queue_reason = "yes", ""
+    if has_rule(desired_ruleset, "merge_queue"):
+        owner = current_merge.get("owner") or {}
+        org = None
+        if owner.get("type") == "Organization" and (
+            current_merge.get("visibility") != "public"
+        ):
+            try:
+                org = _gh_json(["api", f"orgs/{owner.get('login')}"], runner)
+            except RuntimeError:
+                org = None  # plan unreadable: eligibility says "unknown"
+        queue_verdict, queue_reason = merge_queue_eligibility(current_merge, org)
+        live_main = find_main_ruleset(current_rulesets)
+        if (
+            queue_verdict == "unknown"
+            and live_main is not None
+            and not has_rule(live_main, "merge_queue")
+            and ruleset_matches(without_rule(desired_ruleset, "merge_queue"), live_main)
+        ):
+            # Everything but the queue is already live, and we can't tell whether
+            # GitHub offers one here: re-sending it would just be rejected again on
+            # every run. An org owner can read the plan and settle it.
+            queue_verdict = "no"
+            queue_reason = (
+                "the organization's plan isn't visible to this account and the "
+                "live ruleset has no queue (GitHub may have rejected it before); "
+                "re-run as an organization owner to settle it"
+            )
+        if queue_verdict == "no":
+            desired_ruleset = without_rule(desired_ruleset, "merge_queue")
+            print(_no_queue_notice(repo, queue_reason))
+
+    actions = plan_actions(
+        current_rulesets,
+        current_merge,
+        desired_ruleset,
+        desired.merge,
+        desired.security,
+        forbidden_rule_types=DEFERRED_RULE_TYPES if args.phase == "bootstrap" else None,
+    )
+    if not actions:
+        print(f"{repo}: settings already aligned — no changes.")
+        return 0
+
+    print(f"{repo}: planned {args.phase} changes:")
+    for kind, method, ident in actions:
+        print(f"  - {kind}: {method}" + (f" (id={ident})" if ident else ""))
+
+    if not args.yes:
+        reply = input("Apply these changes? [y/N] ").strip().lower()
+        if reply != "y":
+            print("Aborted.")
+            return 1
+
+    try:
+        try:
+            _apply_actions(actions, repo, desired, desired_ruleset, runner)
+        except RuntimeError as exc:
+            # Only when eligibility was a guess: GitHub's 422 settles it. Ruleset
+            # actions run first, so nothing else was applied before the failure.
+            if queue_verdict != "unknown" or not _is_merge_queue_rejection(exc):
+                raise
+            desired_ruleset = without_rule(desired_ruleset, "merge_queue")
+            print(_no_queue_notice(repo, "GitHub rejected the merge_queue rule"))
+            _apply_actions(actions, repo, desired, desired_ruleset, runner)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Applied {args.phase} settings to {repo}.")
+    if args.phase == "bootstrap":
+        print(
+            "Required CI checks and the merge queue are deferred until the setup "
+            "PR merges. "
+            "After merge, run `make finalize_repo_settings TARGET_REPO="
+            f"{repo}`."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

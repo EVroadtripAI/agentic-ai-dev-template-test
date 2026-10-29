@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "bash .claude/hooks/run-tests-on-stop.sh" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash .claude/hooks/claude_permission_hook.sh" } ] }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(make help)",
+      "Bash(make deps)",
+      "Bash(make lint)",
+      "Bash(make tests)",
+      "Bash(make format)",
+      "Bash(make coverage)",
+      "Bash(make security)",
+      "Bash(make pr_check)",
+      "Bash(make init *)",
+      "Bash(make init_preflight *)",
+      "Bash(make apply_repo_settings_bootstrap *)",
+      "Bash(make finalize_repo_settings *)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(bun install)",
+      "Bash(bun run *)",
+      "Bash(bunx *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(gh issue view *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr comment * bugbot run*)",
+      "Bash(gh pr comment * @coderabbitai review*)",
+      "Bash(gh pr comment * @coderabbitai full review*)",
+      "Bash(coderabbit usage --agent*)",
+      "Bash(coderabbit auth status --agent*)"
+    ]
+  }
+}
