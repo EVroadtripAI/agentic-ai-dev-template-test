@@ -1,4 +1,4 @@
-from example_app.greeting import greet
+from mq_test.greeting import greet
 
 
 def test_greet_returns_personalized_message() -> None:

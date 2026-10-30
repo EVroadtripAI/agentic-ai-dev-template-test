@@ -1,22 +1,46 @@
 [project]
-name = "agentic-ai-dev-template-tooling"
-version = "0.0.0"
-description = "Template-only tooling: tests for the init/apply machinery. Removed or replaced at `make init`."
+# Placeholder name/description — replaced by scripts/init_template.py at `make init`.
+# Kept as a PEP 508-valid identifier so `uv sync` succeeds pre-init; the unique
+# token below (and `Live test of the merge-queue default` literal) are the substitution targets.
+name = "mq-test"
+version = "0.1.0"
+description = "Live test of the merge-queue default"
+readme = "README.md"
 requires-python = ">=3.13.5,<3.14"
-dependencies = []
+dependencies = [
+    "pydantic>=2.12",
+    "python-dotenv>=1.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Build the project package from `src/mq_test/`.
+module-name = "mq_test"
 
 [dependency-groups]
 dev = [
+    "bandit>=1.9.4",
     "black>=26.10.1",
-    "ruff>=0.15.20",
     "mypy>=1.13.0",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "pytest-xdist>=3.6.1",
-    "pyyaml>=6.0.3",
+    "ruff>=0.15.20",
 ]
 
 [tool.black]
 line-length = 88
+
+[tool.mypy]
+python_version = "3.13"
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]
+ignore_missing_imports = true
+show_error_codes = true
+disallow_untyped_defs = true
 
 [tool.ruff]
 line-length = 88
@@ -31,33 +55,12 @@ convention = "numpy"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["E501", "D100", "D101", "D102", "D103", "D104"]
-"scripts/**" = ["E402", "E501", "D100"]
-
-[tool.mypy]
-python_version = "3.13"
-# Cross-module type-checking best practice (learned in a downstream repo).
-# This template type-checks scripts/ + tests/ only. When you add a first-party
-# package under src/<name>/, you MUST also (1) uncomment "src" in `files` below
-# and (2) keep mypy_path set (add explicit_package_bases = true too if tests/
-# lacks __init__.py). Otherwise mypy names your modules `src.<name>.*`,
-# first-party `from <name> import X` imports fall through to the untyped installed
-# distribution, the global `ignore_missing_imports` silences them, and every
-# cross-module import resolves to `Any` while mypy still prints "Success" -- i.e.
-# it silently checks no module boundary. As the project matures, prefer scoping
-# `ignore_missing_imports` per-module (via [[tool.mypy.overrides]]) over the
-# global flag, and add a `src/<name>/py.typed` marker LAST -- once the tree is
-# type-clean -- as the downstream "this package is type-safe" guarantee.
-files = [
-    "scripts",
-    "tests",
-    # "src",  # uncomment when you add your package under src/<name>/
-]
-mypy_path = ["src"]
-ignore_missing_imports = true
-show_error_codes = true
-disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests/template"]
-addopts = "-n auto"
-pythonpath = ["."]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-n auto -m 'not e2e and not integration'"
+markers = [
+    "integration: marks tests that call live external APIs",
+    "e2e: marks tests that exercise the full pipeline against live services",
+]
